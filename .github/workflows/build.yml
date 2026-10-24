@@ -1,0 +1,484 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate Complete Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/performance/gpstimer
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GPSDragTimer"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false
+              id("com.google.devtools.ksp") version "2.0.0-1.0.21" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+          }
+
+          android {
+              namespace = "com.performance.gpstimer"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.performance.gpstimer"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(composeBom)
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+
+              val roomVersion = "2.6.1"
+              implementation("androidx.room:room-runtime:$roomVersion")
+              implementation("androidx.room:room-ktx:$roomVersion")
+              ksp("androidx.room:room-compiler:$roomVersion")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="GPS Drag Timer"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <service
+                      android:name=".GpsTelemetryService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:keepScreenOn="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/TimingEngine.kt
+          package com.performance.gpstimer
+
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.sqrt
+
+          enum class TestMode(val title: String) {
+              QUARTER_MILE("1/4 MILE DRAG"),
+              ROLL_100_200("100 - 200 KM/H")
+          }
+
+          enum class RunStatus(val label: String) {
+              IDLE("DISARMED"),
+              WAITING_FOR_GPS("ACQUIRING SATELLITES..."),
+              STAGED_STOP("STAGED - READY TO LAUNCH"),
+              STAGED_ROLL("ARMED - CRUISE BELOW 95 KM/H"),
+              RUNNING("TIMING IN PROGRESS"),
+              COMPLETED("RUN COMPLETE")
+          }
+
+          data class GpsSample(
+              val elapsedNanos: Long,
+              val speedMps: Double,
+              val speedKmh: Double,
+              val cumulativeDistanceM: Double,
+              val altitudeM: Double,
+              val accuracyM: Float,
+              val longitudinalG: Double
+          )
+
+          object TimingConstants {
+              const val ONE_FOOT_M = 0.3048
+              const val DIST_60_FT_M = 18.288
+              const val DIST_330_FT_M = 100.584
+              const val DIST_EIGHTH_MILE_M = 201.168
+              const val DIST_1000_FT_M = 304.800
+              const val DIST_QUARTER_MILE_M = 402.336
+              const val LAUNCH_SPEED_THRESHOLD_KMH = 1.8
+          }
+
+          object TimingMath {
+              fun interpolateTimeAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Long {
+                  val dv = s2.speedKmh - s1.speedKmh
+                  if (abs(dv) < 1e-6) return s2.elapsedNanos
+                  val fraction = ((targetSpeedKmh - s1.speedKmh) / dv).coerceIn(0.0, 1.0)
+                  val dt = s2.elapsedNanos - s1.elapsedNanos
+                  return s1.elapsedNanos + (dt * fraction).toLong()
+              }
+
+              fun interpolateDistanceAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Double {
+                  val crossNanos = interpolateTimeAtSpeed(s1, s2, targetSpeedKmh)
+                  val dt = (crossNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  val totalDt = (s2.elapsedNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  if (totalDt <= 0.0) return s2.cumulativeDistanceM
+                  val accelMps2 = (s2.speedMps - s1.speedMps) / totalDt
+                  return s1.cumulativeDistanceM + (s1.speedMps * dt) + (0.5 * accelMps2 * dt * dt)
+              }
+
+              fun interpolateAltitudeAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Double {
+                  val dv = s2.speedKmh - s1.speedKmh
+                  if (abs(dv) < 1e-6) return s2.altitudeM
+                  val fraction = ((targetSpeedKmh - s1.speedKmh) / dv).coerceIn(0.0, 1.0)
+                  return s1.altitudeM + (s2.altitudeM - s1.altitudeM) * fraction
+              }
+
+              fun interpolateTimeAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Long {
+                  val dx = s2.cumulativeDistanceM - s1.cumulativeDistanceM
+                  if (dx <= 1e-6) return s2.elapsedNanos
+                  val remDist = (targetDistanceM - s1.cumulativeDistanceM).coerceIn(0.0, dx)
+                  val dtSec = (s2.elapsedNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  if (dtSec <= 0.0) return s2.elapsedNanos
+                  val v0 = s1.speedMps
+                  val a = 2.0 * (dx - v0 * dtSec) / (dtSec * dtSec)
+                  val tSec = if (abs(a) < 1e-4) {
+                      if (v0 > 1e-3) remDist / v0 else dtSec * (remDist / dx)
+                  } else {
+                      val disc = max(0.0, v0 * v0 + 2.0 * a * remDist)
+                      val root = (-v0 + sqrt(disc)) / a
+                      if (root in 0.0..dtSec) root else dtSec * (remDist / dx)
+                  }
+                  return s1.elapsedNanos + (tSec * 1_000_000_000.0).toLong()
+              }
+
+              fun interpolateSpeedAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Double {
+                  val crossNanos = interpolateTimeAtDistance(s1, s2, targetDistanceM)
+                  val totalNanos = (s2.elapsedNanos - s1.elapsedNanos).toDouble()
+                  if (totalNanos <= 0.0) return s2.speedKmh
+                  val fraction = ((crossNanos - s1.elapsedNanos) / totalNanos).coerceIn(0.0, 1.0)
+                  return s1.speedKmh + (s2.speedKmh - s1.speedKmh) * fraction
+              }
+
+              fun interpolateAltitudeAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Double {
+                  val dx = s2.cumulativeDistanceM - s1.cumulativeDistanceM
+                  if (dx <= 1e-6) return s2.altitudeM
+                  val fraction = ((targetDistanceM - s1.cumulativeDistanceM) / dx).coerceIn(0.0, 1.0)
+                  return s1.altitudeM + (s2.altitudeM - s1.altitudeM) * fraction
+              }
+
+              fun calculateSlopePercent(startAltM: Double, endAltM: Double, distanceM: Double): Double {
+                  if (distanceM < 10.0) return 0.0
+                  return ((endAltM - startAltM) / distanceM) * 100.0
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/RunDatabase.kt
+          package com.performance.gpstimer
+
+          import android.content.Context
+          import androidx.room.*
+          import kotlinx.coroutines.flow.Flow
+
+          @Entity(tableName = "performance_runs")
+          data class RunRecord(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val timestampEpochMs: Long,
+              val testMode: String,
+              val primaryTimeMs: Long,
+              val trapSpeedKmh: Double,
+              val totalDistanceM: Double,
+              val time60ftMs: Long? = null,
+              val time330ftMs: Long? = null,
+              val timeEighthMileMs: Long? = null,
+              val speedEighthMileKmh: Double? = null,
+              val time1000ftMs: Long? = null,
+              val time0to100Ms: Long? = null,
+              val time100to150Ms: Long? = null,
+              val time150to200Ms: Long? = null,
+              val slopePercent: Double,
+              val isValidSlope: Boolean,
+              val peakG: Double,
+              val rolloutEnabled: Boolean,
+              val gpsHz: Double
+          )
+
+          @Dao
+          interface RunDao {
+              @Query("SELECT * FROM performance_runs ORDER BY timestampEpochMs DESC")
+              fun getAllRuns(): Flow<List<RunRecord>>
+
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertRun(run: RunRecord): Long
+
+              @Delete
+              suspend fun deleteRun(run: RunRecord)
+          }
+
+          @Database(entities = [RunRecord::class], version = 1, exportSchema = false)
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun runDao(): RunDao
+
+              companion object {
+                  @Volatile
+                  private var INSTANCE: AppDatabase? = null
+
+                  fun getInstance(context: Context): AppDatabase {
+                      return INSTANCE ?: synchronized(this) {
+                          Room.databaseBuilder(
+                              context.applicationContext,
+                              AppDatabase::class.java,
+                              "gps_drag_timer.db"
+                          ).build().also { INSTANCE = it }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/GpsTelemetryService.kt
+          package com.performance.gpstimer
+
+          import android.annotation.SuppressLint
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.location.GnssStatus
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.*
+          import androidx.core.app.NotificationCompat
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlin.math.max
+
+          data class TelemetryUiState(
+              val mode: TestMode = TestMode.QUARTER_MILE,
+              val status: RunStatus = RunStatus.IDLE,
+              val rolloutEnabled: Boolean = true,
+              val currentSpeedKmh: Double = 0.0,
+              val currentG: Double = 0.0,
+              val peakG: Double = 0.0,
+              val liveElapsedMs: Long = 0L,
+              val liveDistanceM: Double = 0.0,
+              val satellitesUsed: Int = 0,
+              val satellitesVisible: Int = 0,
+              val accuracyM: Float = 0f,
+              val currentHz: Double = 0.0,
+              val latestRun: RunRecord? = null
+          )
+
+          class GpsTelemetryService : Service(), LocationListener {
+
+              private val binder = LocalBinder()
+              private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+              private lateinit var locationManager: LocationManager
+              private lateinit var database: AppDatabase
+              private var wakeLock: PowerManager.WakeLock? = null
+
+              private val _uiState = MutableStateFlow(TelemetryUiState())
+              val uiState: StateFlow<TelemetryUiState> = _uiState.asStateFlow()
+
+              private var prevSample: GpsSample? = null
+              private var runStartTimeNanos: Long = 0L
+              private var runStartDistanceM: Double = 0.0
+              private var runStartAltitudeM: Double = 0.0
+              private var cumulativeDistanceM: Double = 0.0
+              private var stagingOriginDistanceM: Double = 0.0
+
+              private val recentFixTimesNanos = ArrayDeque<Long>(12)
+
+              private var split60ftMs: Long? = null
+              private var split330ftMs: Long? = null
+              private var splitEighthMs: Long? = null
+              private var speedEighthKmh: Double? = null
+              private var split1000ftMs: Long? = null
+              private var split0to100Ms: Long? = null
+              private var split100to150Ms: Long? = null
+              private var timeAt150Nanos: Long? = null
+              private var peakRunG: Double = 0.0
+
+              inner class LocalBinder : Binder() {
+                  fun getService(): GpsTelemetryService = this@GpsTelemetryService
+              }
+
+              override fun onBind(intent: Intent?): IBinder = binder
+
+              override fun onCreate() {
+                  super.onCreate()
+                  database = AppDatabase.getInstance(this)
+                  locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                  acquireWakeLock()
+                  startForegroundServiceNotification()
+                  startRawGpsUpdates()
+              }
+
+              private val gnssCallback = object : GnssStatus.Callback() {
+                  override fun onSatelliteStatusChanged(status: GnssStatus) {
+                      var used = 0
+                      val total = status.satelliteCount
+                      for (i in 0 until total) {
+                          if (status.usedInFix(i)) used++
+                      }
+                      _uiState.value = _uiState.value.copy(
+                          satellitesUsed = used,
+                          satellitesVisible = total
+                      )
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              fun startRawGpsUpdates() {
+                  try {
+                      locationManager.requestLocationUpdates(
+                          LocationManager.GPS_PROVIDER,
+                          0L,
+                          0f,
+                          this,
+                          Looper.getMainLooper()
+                      )
+                      locationManager.registerGnssStatusCallback(
+                          gnssCallback,
+                          Handler(Looper.getMainLooper())
+                      )
+                  } catch (_: SecurityException) {}
+              }
+
+              fun setTestMode(mode: TestMode) {
+                  disarmRun()
+                  _uiState.value = _uiState.value.copy(mode = mode, latestRun = null)
+              }
+
+              fun toggleRollout(enabled: Boolean) {
+                  _uiState.value = _uiState.value.copy(rolloutEnabled = enabled)
+              }
+
+              fun armSystem() {
+                  resetRunMetrics()
+                  val state = _uiState.value
+                  val nextStatus = when (state.mode) {
+                      TestMode.QUARTER_MILE -> RunStatus.STAGED_STOP
+                      TestMode.ROLL_100_200 -> RunStatus.STAGED_ROLL
+                  }
+                  _uiState.value = state.copy(
+                      status = nextStatus,
+                      liveElapsedMs = 0L,
+                      liveDistanceM = 0.0,
+                      peakG = 0.0
+                  )
+              }
+
+              fun disarmRun() {
+                  resetRunMetrics()
+                  _uiState.value = _uiState.value.copy(
+                      status = RunStatus.IDLE,
+                      liveElapsedMs = 0L,
+                      liveDistanceM = 0.0
+                  )
+              }
+
+              private fun resetRunMetrics() {
+                  runStartTimeNanos = 0L
+                  runStartDistanceM = 0.0
+                  runStartAltitudeM = 0.0
+                  stagingOriginDistanceM = cumulativeDistanceM
+                  split60ftMs = null
+                  split330ftMs = null
+                  splitEighthMs = null
+                  speedEighthKmh = null
+                  split1000ftMs = null
+                  split0to100Ms = null
+                  split100to150Ms = null
+                  timeAt150Nanos = null
+                  peakRunG = 0.0
+              }
+
+              override fun onLocationChanged(location: Location) {
+                  val nowNanos = location.elapsedRealtimeNanos
+                  val rawSpeedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0
+                  val speedMps = if (rawSpeedMps < 0.33) 0.0 else rawSpeedMps
+                  val speedKmh = speedMps * 3.6
+                  val altM = if (location.
