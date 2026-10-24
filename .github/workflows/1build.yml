@@ -1,0 +1,1616 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Generate Project Files
+        run: |
+          mkdir -p app/src/main/java/com/performance/gpstimer
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GPSDragTimer"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false
+              id("com.google.devtools.ksp") version "2.0.0-1.0.21" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+          }
+          
+          android {
+              namespace = "com.performance.gpstimer"
+              compileSdk = 34
+          
+              defaultConfig {
+                  applicationId = "com.performance.gpstimer"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0.0"
+              }
+          
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+          
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(composeBom)
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              val roomVersion = "2.6.1"
+              implementation("androidx.room:room-runtime:$roomVersion")
+              implementation("androidx.room:room-ktx:$roomVersion")
+              ksp("androidx.room:room-compiler:$roomVersion")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <application
+                  android:allowBackup="true"
+                  android:label="GPS Drag Timer"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <service
+                      android:name=".GpsTelemetryService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:keepScreenOn="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/TimingEngine.kt
+          package com.performance.gpstimer
+          
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.sqrt
+          
+          enum class TestKind { DISTANCE, ACCEL_SPEED, ROLL_SPEED, BRAKING }
+          
+          enum class TestMode(
+              val title: String,
+              val subtitle: String,
+              val kind: TestKind,
+              val targetDistanceM: Double = 0.0,
+              val startSpeedKmh: Double = 0.0,
+              val finishSpeedKmh: Double = 0.0,
+              val hasTree: Boolean = false
+          ) {
+              QUARTER_MILE("1/4 MILE", "402.34 m · drag timeslip", TestKind.DISTANCE, targetDistanceM = 402.336),
+              HALF_MILE("1/2 MILE", "804.67 m · standing start", TestKind.DISTANCE, targetDistanceM = 804.672),
+              MILE("1 MILE", "1,609.34 m · standing start", TestKind.DISTANCE, targetDistanceM = 1609.344),
+              ZERO_TO_100("0–100 KM/H", "Standing-start acceleration", TestKind.ACCEL_SPEED, startSpeedKmh = 0.0, finishSpeedKmh = 100.0),
+              ZERO_TO_60_MPH("0–60 MPH", "Standing-start acceleration", TestKind.ACCEL_SPEED, startSpeedKmh = 0.0, finishSpeedKmh = 96.5606),
+              ROLL_100_200("100–200 KM/H", "Rolling acceleration", TestKind.ROLL_SPEED, startSpeedKmh = 100.0, finishSpeedKmh = 200.0),
+              ROLL_60_130_MPH("60–130 MPH", "Rolling acceleration", TestKind.ROLL_SPEED, startSpeedKmh = 96.5606, finishSpeedKmh = 209.214),
+              BRAKE_100_0("100–0 KM/H", "Braking time + stopping distance", TestKind.BRAKING, startSpeedKmh = 100.0, finishSpeedKmh = 0.0),
+              BRAKE_60_0_MPH("60–0 MPH", "Braking time + stopping distance", TestKind.BRAKING, startSpeedKmh = 96.5606, finishSpeedKmh = 0.0),
+              DRAG_TREE("DRAG TREE", "1/4 mile · amber sequence + reaction time", TestKind.DISTANCE, targetDistanceM = 402.336, hasTree = true)
+          }
+          
+          enum class RunStatus(val label: String) {
+              IDLE("DISARMED"),
+              STAGED_STOP("STAGED · READY TO LAUNCH"),
+              STAGED_ROLL("ARMED · WAIT FOR START SPEED"),
+              STAGED_BRAKE("ARMED · ACCELERATE ABOVE TARGET FIRST"),
+              RUNNING("TIMING IN PROGRESS"),
+              COMPLETED("RUN COMPLETE")
+          }
+          
+          data class GpsSample(
+              val elapsedNanos: Long,
+              val speedMps: Double,
+              val speedKmh: Double,
+              val cumulativeDistanceM: Double,
+              val altitudeM: Double,
+              val accuracyM: Float,
+              val longitudinalG: Double
+          )
+          
+          object TimingConstants {
+              const val ONE_FOOT_M = 0.3048
+              const val DIST_60_FT_M = 18.288
+              const val DIST_330_FT_M = 100.584
+              const val DIST_EIGHTH_MILE_M = 201.168
+              const val DIST_1000_FT_M = 304.800
+              const val DIST_QUARTER_MILE_M = 402.336
+              const val LAUNCH_SPEED_THRESHOLD_KMH = 1.8
+              const val STOP_SPEED_THRESHOLD_KMH = 1.8
+          }
+          
+          object TimingMath {
+              fun interpolateTimeAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Long {
+                  val dv = s2.speedKmh - s1.speedKmh
+                  if (abs(dv) < 1e-6) return s2.elapsedNanos
+                  val fraction = ((targetSpeedKmh - s1.speedKmh) / dv).coerceIn(0.0, 1.0)
+                  return s1.elapsedNanos + ((s2.elapsedNanos - s1.elapsedNanos) * fraction).toLong()
+              }
+          
+              fun interpolateDistanceAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Double {
+                  val crossNanos = interpolateTimeAtSpeed(s1, s2, targetSpeedKmh)
+                  val dt = (crossNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  val totalDt = (s2.elapsedNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  if (totalDt <= 0.0) return s2.cumulativeDistanceM
+                  val acceleration = (s2.speedMps - s1.speedMps) / totalDt
+                  return s1.cumulativeDistanceM + s1.speedMps * dt + 0.5 * acceleration * dt * dt
+              }
+          
+              fun interpolateAltitudeAtSpeed(s1: GpsSample, s2: GpsSample, targetSpeedKmh: Double): Double {
+                  val dv = s2.speedKmh - s1.speedKmh
+                  if (abs(dv) < 1e-6) return s2.altitudeM
+                  val fraction = ((targetSpeedKmh - s1.speedKmh) / dv).coerceIn(0.0, 1.0)
+                  return s1.altitudeM + (s2.altitudeM - s1.altitudeM) * fraction
+              }
+          
+              fun interpolateTimeAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Long {
+                  val dx = s2.cumulativeDistanceM - s1.cumulativeDistanceM
+                  if (dx <= 1e-6) return s2.elapsedNanos
+                  val remaining = (targetDistanceM - s1.cumulativeDistanceM).coerceIn(0.0, dx)
+                  val dtSec = (s2.elapsedNanos - s1.elapsedNanos) / 1_000_000_000.0
+                  if (dtSec <= 0.0) return s2.elapsedNanos
+                  val v0 = s1.speedMps
+                  val acceleration = 2.0 * (dx - v0 * dtSec) / (dtSec * dtSec)
+                  val tSec = if (abs(acceleration) < 1e-4) {
+                      if (v0 > 1e-3) remaining / v0 else dtSec * remaining / dx
+                  } else {
+                      val discriminant = max(0.0, v0 * v0 + 2.0 * acceleration * remaining)
+                      val root = (-v0 + sqrt(discriminant)) / acceleration
+                      if (root in 0.0..dtSec) root else dtSec * remaining / dx
+                  }
+                  return s1.elapsedNanos + (tSec * 1_000_000_000.0).toLong()
+              }
+          
+              fun interpolateSpeedAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Double {
+                  val cross = interpolateTimeAtDistance(s1, s2, targetDistanceM)
+                  val dt = (s2.elapsedNanos - s1.elapsedNanos).toDouble()
+                  if (dt <= 0.0) return s2.speedKmh
+                  val fraction = ((cross - s1.elapsedNanos) / dt).coerceIn(0.0, 1.0)
+                  return s1.speedKmh + (s2.speedKmh - s1.speedKmh) * fraction
+              }
+          
+              fun interpolateAltitudeAtDistance(s1: GpsSample, s2: GpsSample, targetDistanceM: Double): Double {
+                  val dx = s2.cumulativeDistanceM - s1.cumulativeDistanceM
+                  if (dx <= 1e-6) return s2.altitudeM
+                  val fraction = ((targetDistanceM - s1.cumulativeDistanceM) / dx).coerceIn(0.0, 1.0)
+                  return s1.altitudeM + (s2.altitudeM - s1.altitudeM) * fraction
+              }
+          
+              fun calculateSlopePercent(startAltM: Double, endAltM: Double, distanceM: Double): Double {
+                  if (distanceM < 10.0) return 0.0
+                  return ((endAltM - startAltM) / distanceM) * 100.0
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/RunDatabase.kt
+          package com.performance.gpstimer
+          
+          import android.content.Context
+          import androidx.room.*
+          import androidx.sqlite.db.SupportSQLiteDatabase
+          import androidx.room.migration.Migration
+          import kotlinx.coroutines.flow.Flow
+          
+          @Entity(tableName = "performance_runs")
+          data class RunRecord(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val timestampEpochMs: Long,
+              val testMode: String,
+              val primaryTimeMs: Long,
+              val trapSpeedKmh: Double,
+              val totalDistanceM: Double,
+              val time60ftMs: Long? = null,
+              val time330ftMs: Long? = null,
+              val timeEighthMileMs: Long? = null,
+              val speedEighthMileKmh: Double? = null,
+              val time1000ftMs: Long? = null,
+              val time0to100Ms: Long? = null,
+              val time100to150Ms: Long? = null,
+              val time150to200Ms: Long? = null,
+              val slopePercent: Double,
+              val isValidSlope: Boolean,
+              val peakG: Double,
+              val rolloutEnabled: Boolean,
+              val gpsHz: Double,
+              val reactionTimeMs: Long? = null
+          )
+          
+          @Dao
+          interface RunDao {
+              @Query("SELECT * FROM performance_runs ORDER BY timestampEpochMs DESC")
+              fun getAllRuns(): Flow<List<RunRecord>>
+          
+              @Insert(onConflict = OnConflictStrategy.REPLACE)
+              suspend fun insertRun(run: RunRecord): Long
+          
+              @Delete
+              suspend fun deleteRun(run: RunRecord)
+          }
+          
+          @Database(entities = [RunRecord::class], version = 2, exportSchema = false)
+          abstract class AppDatabase : RoomDatabase() {
+              abstract fun runDao(): RunDao
+          
+              companion object {
+                  private val MIGRATION_1_2 = object : Migration(1, 2) {
+                      override fun migrate(db: SupportSQLiteDatabase) {
+                          db.execSQL("ALTER TABLE performance_runs ADD COLUMN reactionTimeMs INTEGER")
+                      }
+                  }
+          
+                  @Volatile private var INSTANCE: AppDatabase? = null
+          
+                  fun getInstance(context: Context): AppDatabase {
+                      return INSTANCE ?: synchronized(this) {
+                          INSTANCE ?: Room.databaseBuilder(
+                              context.applicationContext,
+                              AppDatabase::class.java,
+                              "gps_drag_timer.db"
+                          ).addMigrations(MIGRATION_1_2).build().also { INSTANCE = it }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/GpsTelemetryService.kt
+          package com.performance.gpstimer
+          
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.location.GnssStatus
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Binder
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import androidx.core.app.NotificationCompat
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.launch
+          import kotlin.math.abs
+          import kotlin.math.max
+          
+          data class TelemetryUiState(
+              val mode: TestMode = TestMode.QUARTER_MILE,
+              val status: RunStatus = RunStatus.IDLE,
+              val rolloutEnabled: Boolean = true,
+              val currentSpeedKmh: Double = 0.0,
+              val currentG: Double = 0.0,
+              val peakG: Double = 0.0,
+              val liveElapsedMs: Long = 0L,
+              val liveDistanceM: Double = 0.0,
+              val satellitesUsed: Int = 0,
+              val satellitesVisible: Int = 0,
+              val accuracyM: Float = 0f,
+              val currentHz: Double = 0.0,
+              val reactionTimeMs: Long? = null,
+              val latestRun: RunRecord? = null
+          )
+          
+          class GpsTelemetryService : Service(), LocationListener {
+              private val binder = LocalBinder()
+              private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private lateinit var locationManager: LocationManager
+              private lateinit var database: AppDatabase
+              private var wakeLock: PowerManager.WakeLock? = null
+          
+              private val _uiState = MutableStateFlow(TelemetryUiState())
+              val uiState: StateFlow<TelemetryUiState> = _uiState.asStateFlow()
+          
+              private var prevSample: GpsSample? = null
+              private var cumulativeDistanceM = 0.0
+              private var stagingOriginDistanceM = 0.0
+              private var runStartTimeNanos = 0L
+              private var runStartDistanceM = 0.0
+              private var runStartAltitudeM = 0.0
+              private var launchMovementNanos = 0L
+              private var treeGreenTimeNanos: Long? = null
+              private var recentFixTimesNanos = ArrayDeque<Long>(12)
+              private var split60ftMs: Long? = null
+              private var split330ftMs: Long? = null
+              private var splitEighthMs: Long? = null
+              private var speedEighthKmh: Double? = null
+              private var split1000ftMs: Long? = null
+              private var split0to100Ms: Long? = null
+              private var split100to150Ms: Long? = null
+              private var split150to200Ms: Long? = null
+              private var timeAt150Nanos: Long? = null
+              private var peakRunG = 0.0
+          
+              inner class LocalBinder : Binder() {
+                  fun getService(): GpsTelemetryService = this@GpsTelemetryService
+              }
+          
+              override fun onBind(intent: Intent?): IBinder = binder
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  database = AppDatabase.getInstance(this)
+                  locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                  acquireWakeLock()
+                  startForegroundServiceNotification()
+                  startRawGpsUpdates()
+              }
+          
+              private val gnssCallback = object : GnssStatus.Callback() {
+                  override fun onSatelliteStatusChanged(status: GnssStatus) {
+                      var used = 0
+                      for (i in 0 until status.satelliteCount) if (status.usedInFix(i)) used++
+                      _uiState.value = _uiState.value.copy(satellitesUsed = used, satellitesVisible = status.satelliteCount)
+                  }
+              }
+          
+              @SuppressLint("MissingPermission")
+              fun startRawGpsUpdates() {
+                  try {
+                      locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0f, this, Looper.getMainLooper())
+                      locationManager.registerGnssStatusCallback(gnssCallback, Handler(Looper.getMainLooper()))
+                  } catch (_: SecurityException) {
+                      // The activity requests permission before the user can start a run.
+                  } catch (_: IllegalArgumentException) {
+                      // Device has no GPS provider available.
+                  }
+              }
+          
+              fun setTestMode(mode: TestMode) {
+                  disarmRun()
+                  resetRunMetrics()
+                  _uiState.value = _uiState.value.copy(mode = mode, latestRun = null, reactionTimeMs = null)
+              }
+          
+              fun toggleRollout(enabled: Boolean) {
+                  _uiState.value = _uiState.value.copy(rolloutEnabled = enabled)
+              }
+          
+              fun armSystem() {
+                  resetRunMetrics()
+                  val state = _uiState.value
+                  val nextStatus = when (state.mode.kind) {
+                      TestKind.DISTANCE, TestKind.ACCEL_SPEED -> RunStatus.STAGED_STOP
+                      TestKind.ROLL_SPEED -> RunStatus.STAGED_ROLL
+                      TestKind.BRAKING -> RunStatus.STAGED_BRAKE
+                  }
+                  _uiState.value = state.copy(
+                      status = nextStatus,
+                      liveElapsedMs = 0L,
+                      liveDistanceM = 0.0,
+                      peakG = 0.0,
+                      reactionTimeMs = null,
+                      latestRun = null
+                  )
+              }
+          
+              fun disarmRun() {
+                  resetRunMetrics()
+                  _uiState.value = _uiState.value.copy(
+                      status = RunStatus.IDLE,
+                      liveElapsedMs = 0L,
+                      liveDistanceM = 0.0,
+                      reactionTimeMs = null
+                  )
+              }
+          
+              fun notifyTreeGreen(greenRealtimeNanos: Long) {
+                  treeGreenTimeNanos = greenRealtimeNanos
+                  if (launchMovementNanos > 0L) {
+                      val reaction = (launchMovementNanos - greenRealtimeNanos) / 1_000_000L
+                      _uiState.value = _uiState.value.copy(reactionTimeMs = reaction)
+                  }
+              }
+          
+              private fun resetRunMetrics() {
+                  runStartTimeNanos = 0L
+                  runStartDistanceM = cumulativeDistanceM
+                  runStartAltitudeM = prevSample?.altitudeM ?: 0.0
+                  stagingOriginDistanceM = cumulativeDistanceM
+                  launchMovementNanos = 0L
+                  treeGreenTimeNanos = null
+                  split60ftMs = null
+                  split330ftMs = null
+                  splitEighthMs = null
+                  speedEighthKmh = null
+                  split1000ftMs = null
+                  split0to100Ms = null
+                  split100to150Ms = null
+                  split150to200Ms = null
+                  timeAt150Nanos = null
+                  peakRunG = 0.0
+              }
+          
+              override fun onLocationChanged(location: Location) {
+                  val nowNanos = location.elapsedRealtimeNanos
+                  val rawSpeedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0
+                  val speedMps = if (rawSpeedMps < 0.33) 0.0 else rawSpeedMps
+                  val speedKmh = speedMps * 3.6
+                  val altitudeM = if (location.hasAltitude()) location.altitude else 0.0
+                  val accuracyM = if (location.hasAccuracy()) location.accuracy else 99f
+          
+                  recentFixTimesNanos.addLast(nowNanos)
+                  if (recentFixTimesNanos.size > 10) recentFixTimesNanos.removeFirst()
+                  val hz = if (recentFixTimesNanos.size >= 2) {
+                      val span = (recentFixTimesNanos.last() - recentFixTimesNanos.first()) / 1_000_000_000.0
+                      if (span > 0.0) (recentFixTimesNanos.size - 1) / span else 0.0
+                  } else 0.0
+          
+                  val previous = prevSample
+                  var longitudinalG = 0.0
+                  if (previous != null) {
+                      val dtSec = (nowNanos - previous.elapsedNanos) / 1_000_000_000.0
+                      if (dtSec in 0.005..5.0) {
+                          cumulativeDistanceM += 0.5 * (previous.speedMps + speedMps) * dtSec
+                          longitudinalG = ((speedMps - previous.speedMps) / dtSec) / 9.80665
+                      }
+                  }
+          
+                  val current = GpsSample(nowNanos, speedMps, speedKmh, cumulativeDistanceM, altitudeM, accuracyM, longitudinalG)
+                  if (previous != null) processStateMachine(previous, current, hz)
+                  prevSample = current
+                  _uiState.value = _uiState.value.copy(
+                      currentSpeedKmh = speedKmh,
+                      currentG = longitudinalG,
+                      accuracyM = accuracyM,
+                      currentHz = hz
+                  )
+              }
+          
+              private fun processStateMachine(s1: GpsSample, s2: GpsSample, hz: Double) {
+                  val state = _uiState.value
+                  when (state.mode.kind) {
+                      TestKind.DISTANCE -> processDistanceMode(state, s1, s2, hz)
+                      TestKind.ACCEL_SPEED -> processAccelerationMode(state, s1, s2, hz)
+                      TestKind.ROLL_SPEED -> processRollMode(state, s1, s2, hz)
+                      TestKind.BRAKING -> processBrakingMode(state, s1, s2, hz)
+                  }
+              }
+          
+              private fun crossedUp(s1: GpsSample, s2: GpsSample, speedKmh: Double): Boolean =
+                  s1.speedKmh < speedKmh && s2.speedKmh >= speedKmh
+          
+              private fun crossedDown(s1: GpsSample, s2: GpsSample, speedKmh: Double): Boolean =
+                  s1.speedKmh > speedKmh && s2.speedKmh <= speedKmh
+          
+              private fun noteLaunchMovement(s1: GpsSample, s2: GpsSample) {
+                  if (launchMovementNanos == 0L && crossedUp(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH)) {
+                      launchMovementNanos = TimingMath.interpolateTimeAtSpeed(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH)
+                      treeGreenTimeNanos?.let { green ->
+                          _uiState.value = _uiState.value.copy(reactionTimeMs = (launchMovementNanos - green) / 1_000_000L)
+                      }
+                  }
+              }
+          
+              private fun processDistanceMode(state: TelemetryUiState, s1: GpsSample, s2: GpsSample, hz: Double) {
+                  if (state.status == RunStatus.STAGED_STOP) {
+                      if (s2.speedKmh < TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH) {
+                          stagingOriginDistanceM = s2.cumulativeDistanceM
+                          return
+                      }
+                      noteLaunchMovement(s1, s2)
+                      val rollout = state.rolloutEnabled
+                      if (!rollout && launchMovementNanos > 0L) {
+                          beginRun(launchMovementNanos, TimingMath.interpolateDistanceAtSpeed(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH),
+                              TimingMath.interpolateAltitudeAtSpeed(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH))
+                      } else if (rollout) {
+                          val rolloutTarget = stagingOriginDistanceM + TimingConstants.ONE_FOOT_M
+                          if (s2.cumulativeDistanceM >= rolloutTarget) {
+                              beginRun(
+                                  TimingMath.interpolateTimeAtDistance(s1, s2, rolloutTarget),
+                                  rolloutTarget,
+                                  TimingMath.interpolateAltitudeAtDistance(s1, s2, rolloutTarget)
+                              )
+                          }
+                      }
+                  }
+                  if (_uiState.value.status == RunStatus.RUNNING) checkDistanceSplits(s1, s2, hz)
+              }
+          
+              private fun beginRun(startNanos: Long, startDistance: Double, startAltitude: Double) {
+                  if (_uiState.value.status != RunStatus.STAGED_STOP) return
+                  runStartTimeNanos = startNanos
+                  runStartDistanceM = startDistance
+                  runStartAltitudeM = startAltitude
+                  _uiState.value = _uiState.value.copy(status = RunStatus.RUNNING)
+              }
+          
+              private fun checkDistanceSplits(s1: GpsSample, s2: GpsSample, hz: Double) {
+                  val mode = _uiState.value.mode
+                  peakRunG = max(peakRunG, max(0.0, s2.longitudinalG))
+                  val runDistance = max(0.0, s2.cumulativeDistanceM - runStartDistanceM)
+                  val elapsedMs = max(0L, (s2.elapsedNanos - runStartTimeNanos) / 1_000_000L)
+          
+                  fun splitAt(distanceM: Double): Long = max(0L,
+                      (TimingMath.interpolateTimeAtDistance(s1, s2, runStartDistanceM + distanceM) - runStartTimeNanos) / 1_000_000L)
+          
+                  if (split60ftMs == null && runDistance >= TimingConstants.DIST_60_FT_M) split60ftMs = splitAt(TimingConstants.DIST_60_FT_M)
+                  if (split330ftMs == null && runDistance >= TimingConstants.DIST_330_FT_M) split330ftMs = splitAt(TimingConstants.DIST_330_FT_M)
+                  if (splitEighthMs == null && runDistance >= TimingConstants.DIST_EIGHTH_MILE_M) {
+                      val target = runStartDistanceM + TimingConstants.DIST_EIGHTH_MILE_M
+                      splitEighthMs = splitAt(TimingConstants.DIST_EIGHTH_MILE_M)
+                      speedEighthKmh = TimingMath.interpolateSpeedAtDistance(s1, s2, target)
+                  }
+                  if (split1000ftMs == null && runDistance >= TimingConstants.DIST_1000_FT_M) split1000ftMs = splitAt(TimingConstants.DIST_1000_FT_M)
+                  if (split0to100Ms == null && crossedUp(s1, s2, 100.0) && launchMovementNanos > 0L) {
+                      val crossing = TimingMath.interpolateTimeAtSpeed(s1, s2, 100.0)
+                      split0to100Ms = max(0L, (crossing - runStartTimeNanos) / 1_000_000L)
+                  }
+          
+                  val target = runStartDistanceM + mode.targetDistanceM
+                  if (s2.cumulativeDistanceM >= target) {
+                      val finishNanos = TimingMath.interpolateTimeAtDistance(s1, s2, target)
+                      val finishSpeed = TimingMath.interpolateSpeedAtDistance(s1, s2, target)
+                      val finishAltitude = TimingMath.interpolateAltitudeAtDistance(s1, s2, target)
+                      val slope = TimingMath.calculateSlopePercent(runStartAltitudeM, finishAltitude, mode.targetDistanceM)
+                      val reaction = _uiState.value.reactionTimeMs
+                      saveCompletedRun(RunRecord(
+                          timestampEpochMs = System.currentTimeMillis(),
+                          testMode = mode.name,
+                          primaryTimeMs = max(0L, (finishNanos - runStartTimeNanos) / 1_000_000L),
+                          trapSpeedKmh = finishSpeed,
+                          totalDistanceM = mode.targetDistanceM,
+                          time60ftMs = split60ftMs,
+                          time330ftMs = split330ftMs,
+                          timeEighthMileMs = splitEighthMs,
+                          speedEighthMileKmh = speedEighthKmh,
+                          time1000ftMs = split1000ftMs,
+                          time0to100Ms = split0to100Ms,
+                          slopePercent = slope,
+                          isValidSlope = slope >= -1.0,
+                          peakG = peakRunG,
+                          rolloutEnabled = _uiState.value.rolloutEnabled,
+                          gpsHz = hz,
+                          reactionTimeMs = reaction
+                      ))
+                      return
+                  }
+                  _uiState.value = _uiState.value.copy(liveElapsedMs = elapsedMs, liveDistanceM = runDistance, peakG = peakRunG)
+              }
+          
+              private fun processAccelerationMode(state: TelemetryUiState, s1: GpsSample, s2: GpsSample, hz: Double) {
+                  if (state.status == RunStatus.STAGED_STOP) {
+                      if (s2.speedKmh < TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH) return
+                      noteLaunchMovement(s1, s2)
+                      if (launchMovementNanos > 0L && runStartTimeNanos == 0L) {
+                          runStartTimeNanos = launchMovementNanos
+                          runStartDistanceM = TimingMath.interpolateDistanceAtSpeed(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH)
+                          runStartAltitudeM = TimingMath.interpolateAltitudeAtSpeed(s1, s2, TimingConstants.LAUNCH_SPEED_THRESHOLD_KMH)
+                          _uiState.value = _uiState.value.copy(status = RunStatus.RUNNING)
+                      }
+                  }
+                  if (_uiState.value.status != RunStatus.RUNNING) return
+                  peakRunG = max(peakRunG, max(0.0, s2.longitudinalG))
+                  val mode = _uiState.value.mode
+                  if (crossedUp(s1, s2, mode.finishSpeedKmh)) {
+                      val finish = TimingMath.interpolateTimeAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val finishDistance = TimingMath.interpolateDistanceAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val finishAltitude = TimingMath.interpolateAltitudeAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val distance = max(0.0, finishDistance - runStartDistanceM)
+                      val slope = TimingMath.calculateSlopePercent(runStartAltitudeM, finishAltitude, max(10.0, distance))
+                      saveCompletedRun(RunRecord(
+                          timestampEpochMs = System.currentTimeMillis(), testMode = mode.name,
+                          primaryTimeMs = max(0L, (finish - runStartTimeNanos) / 1_000_000L),
+                          trapSpeedKmh = mode.finishSpeedKmh, totalDistanceM = distance,
+                          time0to100Ms = if (mode.finishSpeedKmh == 100.0) max(0L, (finish - runStartTimeNanos) / 1_000_000L) else null,
+                          slopePercent = slope, isValidSlope = slope >= -1.0, peakG = peakRunG,
+                          rolloutEnabled = false, gpsHz = hz, reactionTimeMs = _uiState.value.reactionTimeMs
+                      ))
+                      return
+                  }
+                  _uiState.value = _uiState.value.copy(
+                      liveElapsedMs = max(0L, (s2.elapsedNanos - runStartTimeNanos) / 1_000_000L),
+                      liveDistanceM = max(0.0, s2.cumulativeDistanceM - runStartDistanceM), peakG = peakRunG
+                  )
+              }
+          
+              private fun processRollMode(state: TelemetryUiState, s1: GpsSample, s2: GpsSample, hz: Double) {
+                  val mode = state.mode
+                  if (state.status == RunStatus.STAGED_ROLL && crossedUp(s1, s2, mode.startSpeedKmh)) {
+                      runStartTimeNanos = TimingMath.interpolateTimeAtSpeed(s1, s2, mode.startSpeedKmh)
+                      runStartDistanceM = TimingMath.interpolateDistanceAtSpeed(s1, s2, mode.startSpeedKmh)
+                      runStartAltitudeM = TimingMath.interpolateAltitudeAtSpeed(s1, s2, mode.startSpeedKmh)
+                      peakRunG = max(0.0, s2.longitudinalG)
+                      _uiState.value = _uiState.value.copy(status = RunStatus.RUNNING)
+                  }
+                  if (_uiState.value.status != RunStatus.RUNNING) return
+                  if (s2.speedKmh < mode.startSpeedKmh - 10.0) {
+                      disarmRun()
+                      return
+                  }
+                  peakRunG = max(peakRunG, max(0.0, s2.longitudinalG))
+                  if (mode == TestMode.ROLL_100_200 && split100to150Ms == null && crossedUp(s1, s2, 150.0)) {
+                      val t150 = TimingMath.interpolateTimeAtSpeed(s1, s2, 150.0)
+                      timeAt150Nanos = t150
+                      split100to150Ms = max(0L, (t150 - runStartTimeNanos) / 1_000_000L)
+                  }
+                  if (crossedUp(s1, s2, mode.finishSpeedKmh)) {
+                      val finish = TimingMath.interpolateTimeAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val finishDistance = TimingMath.interpolateDistanceAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val finishAltitude = TimingMath.interpolateAltitudeAtSpeed(s1, s2, mode.finishSpeedKmh)
+                      val distance = max(0.0, finishDistance - runStartDistanceM)
+                      val slope = TimingMath.calculateSlopePercent(runStartAltitudeM, finishAltitude, distance)
+                      if (mode == TestMode.ROLL_100_200) {
+                          split150to200Ms = timeAt150Nanos?.let { max(0L, (finish - it) / 1_000_000L) }
+                      }
+                      saveCompletedRun(RunRecord(
+                          timestampEpochMs = System.currentTimeMillis(), testMode = mode.name,
+                          primaryTimeMs = max(0L, (finish - runStartTimeNanos) / 1_000_000L),
+                          trapSpeedKmh = mode.finishSpeedKmh, totalDistanceM = distance,
+                          time100to150Ms = split100to150Ms, time150to200Ms = split150to200Ms,
+                          slopePercent = slope, isValidSlope = slope >= -1.0, peakG = peakRunG,
+                          rolloutEnabled = false, gpsHz = hz
+                      ))
+                      return
+                  }
+                  _uiState.value = _uiState.value.copy(
+                      liveElapsedMs = max(0L, (s2.elapsedNanos - runStartTimeNanos) / 1_000_000L),
+                      liveDistanceM = max(0.0, s2.cumulativeDistanceM - runStartDistanceM), peakG = peakRunG
+                  )
+              }
+          
+              private fun processBrakingMode(state: TelemetryUiState, s1: GpsSample, s2: GpsSample, hz: Double) {
+                  val mode = state.mode
+                  if (state.status == RunStatus.STAGED_BRAKE && crossedDown(s1, s2, mode.startSpeedKmh)) {
+                      runStartTimeNanos = TimingMath.interpolateTimeAtSpeed(s1, s2, mode.startSpeedKmh)
+                      runStartDistanceM = TimingMath.interpolateDistanceAtSpeed(s1, s2, mode.startSpeedKmh)
+                      runStartAltitudeM = TimingMath.interpolateAltitudeAtSpeed(s1, s2, mode.startSpeedKmh)
+                      peakRunG = abs(s2.longitudinalG)
+                      _uiState.value = _uiState.value.copy(status = RunStatus.RUNNING)
+                  }
+                  if (_uiState.value.status != RunStatus.RUNNING) return
+                  peakRunG = max(peakRunG, abs(s2.longitudinalG))
+                  val stopThreshold = TimingConstants.STOP_SPEED_THRESHOLD_KMH
+                  if (crossedDown(s1, s2, stopThreshold) || s2.speedKmh <= stopThreshold) {
+                      val finish = if (crossedDown(s1, s2, stopThreshold)) TimingMath.interpolateTimeAtSpeed(s1, s2, stopThreshold) else s2.elapsedNanos
+                      val finishDistance = if (crossedDown(s1, s2, stopThreshold)) TimingMath.interpolateDistanceAtSpeed(s1, s2, stopThreshold) else s2.cumulativeDistanceM
+                      val finishAltitude = if (crossedDown(s1, s2, stopThreshold)) TimingMath.interpolateAltitudeAtSpeed(s1, s2, stopThreshold) else s2.altitudeM
+                      val stopDistance = max(0.0, finishDistance - runStartDistanceM)
+                      val slope = TimingMath.calculateSlopePercent(runStartAltitudeM, finishAltitude, max(10.0, stopDistance))
+                      saveCompletedRun(RunRecord(
+                          timestampEpochMs = System.currentTimeMillis(), testMode = mode.name,
+                          primaryTimeMs = max(0L, (finish - runStartTimeNanos) / 1_000_000L),
+                          trapSpeedKmh = mode.startSpeedKmh, totalDistanceM = stopDistance,
+                          slopePercent = slope, isValidSlope = slope >= -1.0, peakG = peakRunG,
+                          rolloutEnabled = false, gpsHz = hz
+                      ))
+                      return
+                  }
+                  _uiState.value = _uiState.value.copy(
+                      liveElapsedMs = max(0L, (s2.elapsedNanos - runStartTimeNanos) / 1_000_000L),
+                      liveDistanceM = max(0.0, s2.cumulativeDistanceM - runStartDistanceM), peakG = peakRunG
+                  )
+              }
+          
+              private fun saveCompletedRun(record: RunRecord) {
+                  serviceScope.launch { database.runDao().insertRun(record) }
+                  _uiState.value = _uiState.value.copy(
+                      status = RunStatus.COMPLETED,
+                      liveElapsedMs = record.primaryTimeMs,
+                      liveDistanceM = record.totalDistanceM,
+                      peakG = record.peakG,
+                      reactionTimeMs = record.reactionTimeMs ?: _uiState.value.reactionTimeMs,
+                      latestRun = record
+                  )
+              }
+          
+              private fun acquireWakeLock() {
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GpsDragTimer::WakeLock").apply {
+                      acquire(2 * 60 * 60 * 1000L)
+                  }
+              }
+          
+              private fun startForegroundServiceNotification() {
+                  val channelId = "gps_telemetry_channel"
+                  val channel = NotificationChannel(channelId, "High Precision GPS Telemetry", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("GPS Performance Timer Active")
+                      .setContentText("GPS telemetry is running")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(1001, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                  } else {
+                      startForeground(1001, notification)
+                  }
+              }
+          
+              override fun onProviderDisabled(provider: String) { }
+              override fun onProviderEnabled(provider: String) { }
+              @Deprecated("Deprecated in Java") override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) { }
+          
+              override fun onDestroy() {
+                  locationManager.removeUpdates(this)
+                  try { locationManager.unregisterGnssStatusCallback(gnssCallback) } catch (_: Exception) { }
+                  wakeLock?.let { if (it.isHeld) it.release() }
+                  serviceScope.cancel()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/performance/gpstimer/MainActivity.kt
+          package com.performance.gpstimer
+          
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.content.ComponentName
+          import android.content.pm.PackageManager
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.IBinder
+          import android.os.SystemClock
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material.icons.filled.Delete
+          import androidx.compose.material.icons.filled.History
+          import androidx.compose.material.icons.filled.Home
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material.icons.filled.Share
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          
+          private enum class AppPage { HOME, TIMER, HISTORY, SETTINGS }
+          
+          data class AppSettings(
+              val darkTheme: Boolean = true,
+              val useMph: Boolean = false,
+              val rolloutEnabled: Boolean = true,
+              val showGpsDiagnostics: Boolean = true,
+              val beepOnGreen: Boolean = true
+          )
+          
+          private fun loadAppSettings(context: Context): AppSettings {
+              val p = context.getSharedPreferences("gps_drag_timer_settings", Context.MODE_PRIVATE)
+              return AppSettings(
+                  darkTheme = p.getBoolean("darkTheme", true),
+                  useMph = p.getBoolean("useMph", false),
+                  rolloutEnabled = p.getBoolean("rolloutEnabled", true),
+                  showGpsDiagnostics = p.getBoolean("showGpsDiagnostics", true),
+                  beepOnGreen = p.getBoolean("beepOnGreen", true)
+              )
+          }
+          
+          private fun saveAppSettings(context: Context, value: AppSettings) {
+              context.getSharedPreferences("gps_drag_timer_settings", Context.MODE_PRIVATE).edit()
+                  .putBoolean("darkTheme", value.darkTheme)
+                  .putBoolean("useMph", value.useMph)
+                  .putBoolean("rolloutEnabled", value.rolloutEnabled)
+                  .putBoolean("showGpsDiagnostics", value.showGpsDiagnostics)
+                  .putBoolean("beepOnGreen", value.beepOnGreen)
+                  .apply()
+          }
+          
+          class MainActivity : ComponentActivity() {
+              private var telemetryService by mutableStateOf<GpsTelemetryService?>(null)
+              private var isBound = false
+          
+              private val connection = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                      telemetryService = (service as GpsTelemetryService.LocalBinder).getService()
+                      isBound = true
+                  }
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      telemetryService = null
+                      isBound = false
+                  }
+              }
+          
+              private fun startAndBindTelemetryService() {
+                  if (!isBound) {
+                      val intent = Intent(this, GpsTelemetryService::class.java)
+                      ContextCompat.startForegroundService(this, intent)
+                      bindService(intent, connection, Context.BIND_AUTO_CREATE)
+                  } else {
+                      telemetryService?.startRawGpsUpdates()
+                  }
+              }
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val database = AppDatabase.getInstance(this)
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                      startAndBindTelemetryService()
+                  }
+                  setContent {
+                      PerformanceTimerApp(
+                          service = telemetryService,
+                          runDao = database.runDao(),
+                          onPermissionGranted = { startAndBindTelemetryService() }
+                      )
+                  }
+              }
+          
+              override fun onDestroy() {
+                  if (isBound) {
+                      unbindService(connection)
+                      isBound = false
+                  }
+                  super.onDestroy()
+              }
+          }
+          
+          @Composable
+          fun PerformanceTimerApp(
+              service: GpsTelemetryService?,
+              runDao: RunDao,
+              onPermissionGranted: () -> Unit
+          ) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var settings by remember { mutableStateOf(loadAppSettings(context)) }
+              var page by remember { mutableStateOf(AppPage.HOME) }
+              var treeSequenceKey by remember { mutableIntStateOf(0) }
+              var treePhase by remember { mutableIntStateOf(0) }
+              var treeSequenceRunning by remember { mutableStateOf(false) }
+          
+              val hasLocationPermissionState = remember {
+                  mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED)
+              }
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  contract = ActivityResultContracts.RequestMultiplePermissions()
+              ) { grants ->
+                  val granted = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true
+                  hasLocationPermissionState.value = granted
+                  if (granted) onPermissionGranted()
+              }
+          
+              LaunchedEffect(Unit) {
+                  service?.toggleRollout(settings.rolloutEnabled)
+                  if (!hasLocationPermissionState.value) {
+                      val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                      permissionLauncher.launch(perms.toTypedArray())
+                  }
+              }
+          
+              val uiState by service?.uiState?.collectAsState() ?: remember { mutableStateOf(TelemetryUiState()) }
+              val allRuns by runDao.getAllRuns().collectAsState(initial = emptyList())
+          
+              LaunchedEffect(treeSequenceKey) {
+                  if (treeSequenceKey > 0) {
+                      treeSequenceRunning = true
+                      treePhase = 1 // pre-stage
+                      delay(350)
+                      treePhase = 2 // stage
+                      delay(350)
+                      treePhase = 3 // amber 1
+                      delay(500)
+                      treePhase = 4 // amber 2
+                      delay(500)
+                      treePhase = 5 // amber 3
+                      delay(500)
+                      treePhase = 6 // green
+                      service?.notifyTreeGreen(SystemClock.elapsedRealtimeNanos())
+                      if (settings.beepOnGreen) playGreenBeep()
+                      treeSequenceRunning = false
+                  } else {
+                      treeSequenceRunning = false
+                      treePhase = 0
+                  }
+              }
+          
+              fun updateSettings(next: AppSettings) {
+                  settings = next
+                  saveAppSettings(context, next)
+                  service?.toggleRollout(next.rolloutEnabled)
+              }
+          
+              val colors = if (settings.darkTheme) {
+                  darkColorScheme(
+                      primary = Color(0xFF00E676), secondary = Color(0xFF40C4FF),
+                      background = Color(0xFF090D12), surface = Color(0xFF151B22),
+                      onBackground = Color(0xFFF3F6F8), onSurface = Color(0xFFF3F6F8)
+                  )
+              } else {
+                  lightColorScheme(
+                      primary = Color(0xFF087F45), secondary = Color(0xFF006C9C),
+                      background = Color(0xFFF3F6F8), surface = Color.White,
+                      onBackground = Color(0xFF101820), onSurface = Color(0xFF101820)
+                  )
+              }
+          
+              MaterialTheme(colorScheme = colors) {
+                  Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                      Column(modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp)) {
+                          TopNavigation(
+                              page = page,
+                              runCount = allRuns.size,
+                              onHome = { page = AppPage.HOME; treeSequenceKey = 0 },
+                              onHistory = { page = AppPage.HISTORY; treeSequenceKey = 0 },
+                              onSettings = { page = AppPage.SETTINGS; treeSequenceKey = 0 }
+                          )
+                          if (settings.showGpsDiagnostics && page != AppPage.SETTINGS) {
+                              Spacer(Modifier.height(8.dp))
+                              GpsStatusBar(uiState)
+                          }
+                          Spacer(Modifier.height(10.dp))
+          
+                          when (page) {
+                              AppPage.HOME -> HomeScreen(
+                                  uiState = uiState,
+                                  settings = settings,
+                                  onSelectMode = { mode ->
+                                      service?.setTestMode(mode)
+                                      service?.toggleRollout(settings.rolloutEnabled)
+                                      treeSequenceKey = 0
+                                      page = AppPage.TIMER
+                                  },
+                                  onHistory = { page = AppPage.HISTORY },
+                                  onSettings = { page = AppPage.SETTINGS }
+                              )
+                              AppPage.TIMER -> LiveTelemetryScreen(
+                                  uiState = uiState,
+                                  settings = settings,
+                                  treePhase = treePhase,
+                                  treeSequenceRunning = treeSequenceRunning,
+                                  onToggleRollout = { enabled -> updateSettings(settings.copy(rolloutEnabled = enabled)) },
+                                  onArmToggle = {
+                                      if (uiState.status == RunStatus.IDLE || uiState.status == RunStatus.COMPLETED) {
+                                          treeSequenceKey = 0
+                                          service?.armSystem()
+                                      } else if (uiState.status == RunStatus.STAGED_STOP && uiState.mode.hasTree) {
+                                          if (!treeSequenceRunning) treeSequenceKey += 1
+                                      } else {
+                                          treeSequenceKey = 0
+                                          service?.disarmRun()
+                                      }
+                                  },
+                                  onOpenHome = { page = AppPage.HOME; treeSequenceKey = 0 },
+                                  onOpenSettings = { page = AppPage.SETTINGS; treeSequenceKey = 0 }
+                              )
+                              AppPage.HISTORY -> RunHistoryScreen(
+                                  runs = allRuns,
+                                  useMph = settings.useMph,
+                                  onDeleteRun = { run -> scope.launch { runDao.deleteRun(run) } },
+                                  onExportCsv = { shareRunsAsCsv(context, allRuns) }
+                              )
+                              AppPage.SETTINGS -> SettingsScreen(settings = settings, onChange = ::updateSettings)
+                          }
+                      }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun TopNavigation(page: AppPage, runCount: Int, onHome: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit) {
+              Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.SpaceBetween
+              ) {
+                  Column(modifier = Modifier.weight(1f)) {
+                      Text("GPS DRAG TIMER", fontWeight = FontWeight.Black, fontSize = 20.sp, fontFamily = FontFamily.Monospace)
+                      Text(
+                          when (page) {
+                              AppPage.HOME -> "SELECT A TEST"
+                              AppPage.TIMER -> "LIVE TELEMETRY"
+                              AppPage.HISTORY -> "SAVED RUNS"
+                              AppPage.SETTINGS -> "APP SETTINGS"
+                          },
+                          color = MaterialTheme.colorScheme.primary,
+                          fontSize = 10.sp,
+                          fontWeight = FontWeight.Bold,
+                          fontFamily = FontFamily.Monospace
+                      )
+                  }
+                  IconButton(onClick = onHome) { Icon(Icons.Filled.Home, contentDescription = "Home") }
+                  IconButton(onClick = onHistory) { Icon(Icons.Filled.History, contentDescription = "Run history") }
+                  IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
+              }
+          }
+          
+          @Composable
+          private fun HomeScreen(
+              uiState: TelemetryUiState,
+              settings: AppSettings,
+              onSelectMode: (TestMode) -> Unit,
+              onHistory: () -> Unit,
+              onSettings: () -> Unit
+          ) {
+              Column(modifier = Modifier.fillMaxSize()) {
+                  Column(modifier = Modifier.verticalScroll(rememberScrollState()).weight(1f)) {
+                      Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface, tonalElevation = 2.dp) {
+                          Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                              Text("PERFORMANCE TESTS", fontSize = 20.sp, fontWeight = FontWeight.Black)
+                              Spacer(Modifier.height(5.dp))
+                              Text(
+                                  "Choose a test to arm the GPS timer. Runs are saved automatically when the finish condition is reached.",
+                                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f), fontSize = 13.sp
+                              )
+                              Spacer(Modifier.height(12.dp))
+                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  SummaryChip("UNITS", if (settings.useMph) "MPH" else "KM/H")
+                                  SummaryChip("THEME", if (settings.darkTheme) "DARK" else "LIGHT")
+                                  SummaryChip("GPS", if (uiState.satellitesUsed >= 6) "LOCKED" else "SEARCHING")
+                              }
+                          }
+                      }
+                      Spacer(Modifier.height(14.dp))
+                      Text("DRAG & DISTANCE", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                      Spacer(Modifier.height(6.dp))
+                      listOf(TestMode.QUARTER_MILE, TestMode.DRAG_TREE, TestMode.HALF_MILE, TestMode.MILE).forEach { mode ->
+                          ModeCard(mode, onClick = { onSelectMode(mode) })
+                          Spacer(Modifier.height(8.dp))
+                      }
+                      Spacer(Modifier.height(7.dp))
+                      Text("ACCELERATION", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                      Spacer(Modifier.height(6.dp))
+                      listOf(TestMode.ZERO_TO_100, TestMode.ZERO_TO_60_MPH, TestMode.ROLL_100_200, TestMode.ROLL_60_130_MPH).forEach { mode ->
+                          ModeCard(mode, onClick = { onSelectMode(mode) })
+                          Spacer(Modifier.height(8.dp))
+                      }
+                      Spacer(Modifier.height(7.dp))
+                      Text("BRAKING", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                      Spacer(Modifier.height(6.dp))
+                      listOf(TestMode.BRAKE_100_0, TestMode.BRAKE_60_0_MPH).forEach { mode ->
+                          ModeCard(mode, onClick = { onSelectMode(mode) })
+                          Spacer(Modifier.height(8.dp))
+                      }
+                      Spacer(Modifier.height(8.dp))
+                      Text(
+                          "GPS-ESTIMATED TIMING · USE ONLY ON A CLOSED COURSE. Not a substitute for official track timing.",
+                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f), fontSize = 10.sp, fontFamily = FontFamily.Monospace
+                      )
+                      Spacer(Modifier.height(10.dp))
+                  }
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                      OutlinedButton(onClick = onHistory, modifier = Modifier.weight(1f)) { Icon(Icons.Filled.History, null); Spacer(Modifier.width(5.dp)); Text("RUN LOGS") }
+                      OutlinedButton(onClick = onSettings, modifier = Modifier.weight(1f)) { Icon(Icons.Filled.Settings, null); Spacer(Modifier.width(5.dp)); Text("SETTINGS") }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun ModeCard(mode: TestMode, onClick: () -> Unit) {
+              Surface(
+                  modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+                  shape = RoundedCornerShape(12.dp),
+                  color = MaterialTheme.colorScheme.surface,
+                  border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+              ) {
+                  Row(Modifier.padding(horizontal = 14.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Box(Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.13f)), contentAlignment = Alignment.Center) {
+                          Text(if (mode.kind == TestKind.BRAKING) "−G" else if (mode.hasTree) "RT" else "▶", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                      }
+                      Spacer(Modifier.width(12.dp))
+                      Column(modifier = Modifier.weight(1f)) {
+                          Text(mode.title, fontSize = 15.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                          Text(mode.subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f))
+                      }
+                      Text("START ›", fontSize = 10.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
+                  }
+              }
+          }
+          
+          @Composable
+          private fun SummaryChip(label: String, value: String) {
+              Column(Modifier.clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.background).padding(horizontal = 10.dp, vertical = 7.dp)) {
+                  Text(label, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), fontWeight = FontWeight.Bold)
+                  Text(value, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black)
+              }
+          }
+          
+          @Composable
+          private fun GpsStatusBar(uiState: TelemetryUiState) {
+              val good = uiState.satellitesUsed >= 10 && uiState.accuracyM <= 3.5f
+              val medium = uiState.satellitesUsed >= 6
+              val statusColor = if (good) Color(0xFF00C853) else if (medium) Color(0xFFFFB300) else Color(0xFFD84343)
+              Row(
+                  modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surface).padding(horizontal = 12.dp, vertical = 9.dp),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Box(Modifier.size(8.dp).clip(CircleShape).background(statusColor))
+                      Spacer(Modifier.width(7.dp))
+                      Text("SATS ${uiState.satellitesUsed}/${uiState.satellitesVisible}", fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                  }
+                  Text("±${String.format(Locale.US, "%.1f", uiState.accuracyM)} m", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f), fontFamily = FontFamily.Monospace)
+                  Text(String.format(Locale.US, "%.1f Hz", uiState.currentHz), fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+              }
+          }
+          
+          @Composable
+          private fun LiveTelemetryScreen(
+              uiState: TelemetryUiState,
+              settings: AppSettings,
+              treePhase: Int,
+              treeSequenceRunning: Boolean,
+              onToggleRollout: (Boolean) -> Unit,
+              onArmToggle: () -> Unit,
+              onOpenHome: () -> Unit,
+              onOpenSettings: () -> Unit
+          ) {
+              Column(modifier = Modifier.fillMaxSize()) {
+                  Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                      Column(Modifier.weight(1f)) {
+                          Text(uiState.mode.title, fontSize = 18.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                          Text(uiState.status.label, fontSize = 10.sp, color = statusColor(uiState.status), fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                      }
+                      TextButton(onClick = onOpenHome) { Icon(Icons.Filled.ArrowBack, null); Text("MODES") }
+                      IconButton(onClick = onOpenSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  if (uiState.mode.kind == TestKind.DISTANCE) {
+                      Row(
+                          Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surface).padding(horizontal = 10.dp, vertical = 4.dp),
+                          horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Text("1-FT ROLLOUT (${if (settings.useMph) "0.3 m" else "0.30 m"})", fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                          Switch(checked = uiState.rolloutEnabled, onCheckedChange = onToggleRollout)
+                      }
+                      Spacer(Modifier.height(8.dp))
+                  }
+                  if (uiState.mode.hasTree) {
+                      DragTreePanel(treePhase, treeSequenceRunning, uiState.reactionTimeMs)
+                      Spacer(Modifier.height(8.dp))
+                  }
+                  Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp) {
+                      Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                              Column {
+                                  Text("GPS SPEED", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                  Row(verticalAlignment = Alignment.Bottom) {
+                                      Text(String.format(Locale.US, "%.1f", speedForDisplay(uiState.currentSpeedKmh, settings.useMph)), fontSize = 40.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                                      Spacer(Modifier.width(5.dp))
+                                      Text(if (settings.useMph) "MPH" else "KM/H", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp))
+                                  }
+                              }
+                              Column(horizontalAlignment = Alignment.End) {
+                                  Text("ELAPSED", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                                  Text(formatMsToSec(uiState.liveElapsedMs), fontSize = 32.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary, fontFamily = FontFamily.Monospace)
+                              }
+                          }
+                          Spacer(Modifier.height(8.dp))
+                          HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                          Spacer(Modifier.height(9.dp))
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                              MetricPill("DISTANCE", formatDistance(uiState.liveDistanceM, settings.useMph))
+                              MetricPill("LIVE G", String.format(Locale.US, "%.2f G", uiState.currentG))
+                              MetricPill(if (uiState.mode.kind == TestKind.BRAKING) "PEAK DECEL" else "PEAK G", String.format(Locale.US, "%.2f G", uiState.peakG))
+                          }
+                          if (uiState.mode.hasTree && uiState.reactionTimeMs != null) {
+                              Spacer(Modifier.height(8.dp))
+                              Text(
+                                  if (uiState.reactionTimeMs < 0) "RED LIGHT · ${formatSignedMs(uiState.reactionTimeMs)}" else "REACTION TIME · ${formatSignedMs(uiState.reactionTimeMs)}",
+                                  color = if (uiState.reactionTimeMs < 0) Color(0xFFFF5252) else MaterialTheme.colorScheme.primary,
+                                  fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Black, fontSize = 14.sp
+                              )
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  TimeSlipCard(mode = uiState.mode, run = uiState.latestRun, settings = settings, modifier = Modifier.weight(1f, fill = false))
+                  Spacer(Modifier.height(8.dp))
+                  val actionText = when {
+                      uiState.status == RunStatus.IDLE || uiState.status == RunStatus.COMPLETED -> "ARM ${if (uiState.mode.hasTree) "DRAG TREE" else "TIMER"}"
+                      uiState.mode.hasTree && uiState.status == RunStatus.STAGED_STOP && !treeSequenceRunning && treePhase != 6 -> "START TREE"
+                      uiState.mode.hasTree && uiState.status == RunStatus.STAGED_STOP && treePhase == 6 -> "RUN TREE AGAIN"
+                      treeSequenceRunning -> "TREE SEQUENCE RUNNING…"
+                      else -> "ABORT / DISARM"
+                  }
+                  Button(
+                      onClick = onArmToggle,
+                      enabled = !treeSequenceRunning || uiState.status == RunStatus.RUNNING,
+                      modifier = Modifier.fillMaxWidth().height(52.dp),
+                      shape = RoundedCornerShape(11.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (uiState.status == RunStatus.RUNNING) Color(0xFFD84343) else MaterialTheme.colorScheme.primary,
+                          contentColor = if (uiState.status == RunStatus.RUNNING) Color.White else if (settings.darkTheme) Color.Black else Color.White
+                      )
+                  ) {
+                      Text(actionText, fontSize = 15.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                  }
+                  Spacer(Modifier.height(5.dp))
+                  if (settings.showGpsDiagnostics) {
+                      Text(
+                          "GPS ESTIMATE · accuracy ${String.format(Locale.US, "%.1f", uiState.accuracyM)} m · ${String.format(Locale.US, "%.1f", uiState.currentHz)} Hz",
+                          modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f), fontSize = 9.sp, fontFamily = FontFamily.Monospace
+                      )
+                  }
+              }
+          }
+          
+          @Composable
+          private fun DragTreePanel(phase: Int, running: Boolean, reactionTimeMs: Long?) {
+              Surface(shape = RoundedCornerShape(12.dp), color = Color(0xFF101418), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF343B42))) {
+                  Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                          Text("PRE-STAGE", color = Color.LightGray, fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                          LightBulb(phase >= 1, Color(0xFFFFE082))
+                          Spacer(Modifier.height(3.dp))
+                          Text("STAGE", color = Color.LightGray, fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                          LightBulb(phase >= 2, Color(0xFFFFE082))
+                      }
+                      Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.1f)) {
+                          Text("SPORTSMAN TREE", color = Color(0xFFB0BEC5), fontSize = 9.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                          Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically) {
+                              LightBulb(phase >= 3 && phase < 6, Color(0xFFFFB300))
+                              LightBulb(phase >= 4 && phase < 6, Color(0xFFFFB300))
+                              LightBulb(phase >= 5 && phase < 6, Color(0xFFFFB300))
+                          }
+                          Spacer(Modifier.height(4.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              LightBulb(phase == 6, Color(0xFF00E676), size = 24.dp)
+                              Text(if (phase == 6) "GREEN" else if (running) "COUNTDOWN" else "READY WHEN ARMED", color = if (phase == 6) Color(0xFF00E676) else Color(0xFFB0BEC5), fontSize = 9.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                          }
+                      }
+                      Column(horizontalAlignment = Alignment.End, modifier = Modifier.weight(1f)) {
+                          Text("REACTION", color = Color(0xFFB0BEC5), fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                          Text(
+                              reactionTimeMs?.let { formatSignedMs(it) } ?: "—.———",
+                              color = if (reactionTimeMs != null && reactionTimeMs < 0) Color(0xFFFF5252) else Color(0xFF00E676),
+                              fontSize = 16.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace
+                          )
+                          Text(if (reactionTimeMs != null && reactionTimeMs < 0) "RED LIGHT" else "GPS MOVEMENT", color = Color(0xFFB0BEC5), fontSize = 7.sp)
+                      }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun LightBulb(on: Boolean, onColor: Color, size: androidx.compose.ui.unit.Dp = 17.dp) {
+              Box(
+                  Modifier.size(size).clip(CircleShape).background(if (on) onColor else Color(0xFF292F34))
+                      .border(1.dp, if (on) onColor else Color(0xFF4A5258), CircleShape)
+              )
+          }
+          
+          @Composable
+          private fun TimeSlipCard(mode: TestMode, run: RunRecord?, settings: AppSettings, modifier: Modifier = Modifier) {
+              Surface(modifier = modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surface) {
+                  Column(Modifier.padding(12.dp)) {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text("DIGITAL TIME SLIP", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                          if (run != null) Text(if (run.isValidSlope) "SLOPE OK*" else "CHECK SLOPE*", color = if (run.isValidSlope) MaterialTheme.colorScheme.primary else Color(0xFFFF5252), fontWeight = FontWeight.Bold, fontSize = 9.sp)
+                      }
+                      Spacer(Modifier.height(5.dp))
+                      HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                      Spacer(Modifier.height(5.dp))
+                      if (mode.kind == TestKind.DISTANCE) {
+                          if (mode.targetDistanceM >= TimingConstants.DIST_QUARTER_MILE_M - 1.0) {
+                              SlipRow("60 FT", formatNullableMs(run?.time60ftMs))
+                              SlipRow("330 FT", formatNullableMs(run?.time330ftMs))
+                              SlipRow("1/8 MILE", if (run?.timeEighthMileMs != null) "${formatMsToSec(run.timeEighthMileMs)} @ ${formatSpeed(run.speedEighthMileKmh ?: 0.0, settings.useMph)}" else "—.———")
+                              SlipRow("1000 FT", formatNullableMs(run?.time1000ftMs))
+                          }
+                          SlipRow(mode.title, if (run != null && run.testMode == mode.name) formatMsToSec(run.primaryTimeMs) else "—.———", true)
+                          SlipRow("FINISH SPEED", if (run != null && run.testMode == mode.name) formatSpeed(run.trapSpeedKmh, settings.useMph) else "—")
+                          if (mode.hasTree) SlipRow("REACTION TIME", if (run?.reactionTimeMs != null) formatSignedMs(run.reactionTimeMs) else "—.———", true)
+                      } else if (mode.kind == TestKind.ACCEL_SPEED) {
+                          SlipRow("TOTAL TIME", if (run != null && run.testMode == mode.name) formatMsToSec(run.primaryTimeMs) else "—.———", true)
+                          SlipRow("DISTANCE", if (run != null && run.testMode == mode.name) formatDistance(run.totalDistanceM, settings.useMph) else "—")
+                          SlipRow("TARGET SPEED", formatSpeed(mode.finishSpeedKmh, settings.useMph))
+                      } else if (mode.kind == TestKind.ROLL_SPEED) {
+                          if (mode == TestMode.ROLL_100_200) {
+                              SlipRow("100–150 KM/H", formatNullableMs(run?.time100to150Ms))
+                              SlipRow("150–200 KM/H", formatNullableMs(run?.time150to200Ms))
+                          }
+                          SlipRow("${mode.title} TIME", if (run != null && run.testMode == mode.name) formatMsToSec(run.primaryTimeMs) else "—.———", true)
+                          SlipRow("ROLL DISTANCE", if (run != null && run.testMode == mode.name) formatDistance(run.totalDistanceM, settings.useMph) else "—")
+                      } else {
+                          SlipRow("BRAKING TIME", if (run != null && run.testMode == mode.name) formatMsToSec(run.primaryTimeMs) else "—.———", true)
+                          SlipRow("START SPEED", formatSpeed(mode.startSpeedKmh, settings.useMph))
+                          SlipRow("STOPPING DISTANCE", if (run != null && run.testMode == mode.name) formatDistance(run.totalDistanceM, settings.useMph) else "—", true)
+                          SlipRow("PEAK DECELERATION", if (run != null && run.testMode == mode.name) String.format(Locale.US, "%.2f G", run.peakG) else "—")
+                          SlipRow("AVERAGE DECELERATION", if (run != null && run.testMode == mode.name && run.totalDistanceM > 0.0) String.format(Locale.US, "%.2f G", averageBrakingG(run)) else "—")
+                      }
+                      if (run != null && run.testMode == mode.name) {
+                          Spacer(Modifier.height(4.dp))
+                          Text("GPS ${String.format(Locale.US, "%.1f", run.gpsHz)} Hz · SLOPE ${String.format(Locale.US, "%.2f", run.slopePercent)}% · PEAK ${String.format(Locale.US, "%.2f", run.peakG)} G", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f), fontFamily = FontFamily.Monospace)
+                      } else {
+                          Text("Results appear here after a completed pass.", fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
+                      }
+                      Text("*Slope flag is only a basic GPS altitude check, not official track validation.", fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.48f))
+                  }
+              }
+          }
+          
+          @Composable
+          private fun SettingsScreen(settings: AppSettings, onChange: (AppSettings) -> Unit) {
+              Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                  Text("DISPLAY", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                  SettingSwitch("Dark theme", "Switch between dark and light appearance", settings.darkTheme) { onChange(settings.copy(darkTheme = it)) }
+                  SettingSwitch("Use MPH", "Display speeds and distances in imperial units where applicable", settings.useMph) { onChange(settings.copy(useMph = it)) }
+                  Spacer(Modifier.height(10.dp))
+                  Text("TIMING", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                  SettingSwitch("1-foot rollout", "For standing-start distance tests, start ET after the first foot", settings.rolloutEnabled) { onChange(settings.copy(rolloutEnabled = it)) }
+                  SettingSwitch("GPS diagnostics", "Show satellite count, estimated accuracy and sample rate", settings.showGpsDiagnostics) { onChange(settings.copy(showGpsDiagnostics = it)) }
+                  SettingSwitch("Beep on green", "Play a short tone when the drag tree turns green", settings.beepOnGreen) { onChange(settings.copy(beepOnGreen = it)) }
+                  Spacer(Modifier.height(12.dp))
+                  Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surface) {
+                      Column(Modifier.padding(14.dp)) {
+                          Text("ABOUT GPS TIMING", fontSize = 12.sp, fontWeight = FontWeight.Black)
+                          Spacer(Modifier.height(6.dp))
+                          Text(
+                              "The app interpolates between Android GPS fixes to estimate elapsed times, trap speed and stopping distance. Accuracy depends on the phone, sky view, GPS update rate and conditions. The drag-tree reaction time is based on detected GPS movement, not a track beam, and may be delayed by GPS sampling. For repeatable results, use a high-rate external GNSS receiver and compare against official timing equipment.",
+                              fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          Text("Use only on a closed course in a safe, legal environment.", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFFD84343))
+                      }
+                  }
+                  Spacer(Modifier.height(18.dp))
+              }
+          }
+          
+          @Composable
+          private fun SettingSwitch(title: String, description: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+              Row(
+                  modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                      Text(title, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                      Text(description, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f), fontSize = 11.sp)
+                  }
+                  Switch(checked = checked, onCheckedChange = onCheckedChange)
+              }
+              HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+          }
+          
+          @Composable
+          private fun RunHistoryScreen(runs: List<RunRecord>, useMph: Boolean, onDeleteRun: (RunRecord) -> Unit, onExportCsv: () -> Unit) {
+              Column(modifier = Modifier.fillMaxSize()) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                      Text("SAVED PERFORMANCE RUNS", fontSize = 12.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                      Button(onClick = onExportCsv, enabled = runs.isNotEmpty()) {
+                          Icon(Icons.Filled.Share, contentDescription = "Export CSV")
+                          Spacer(Modifier.width(5.dp))
+                          Text("CSV")
+                      }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  if (runs.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Text("No saved runs yet. Select a mode and complete a test.", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
+                      }
+                  } else {
+                      LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          items(runs, key = { it.id }) { run -> RunHistoryItem(run, useMph) { onDeleteRun(run) } }
+                      }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun RunHistoryItem(run: RunRecord, useMph: Boolean, onDelete: () -> Unit) {
+              val dateFormat = remember { SimpleDateFormat("dd MMM yyyy · HH:mm:ss", Locale.getDefault()) }
+              val mode = TestMode.entries.firstOrNull { it.name == run.testMode }
+              Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surface) {
+                  Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Column(Modifier.weight(1f)) {
+                              Text(mode?.title ?: run.testMode, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                              Text(dateFormat.format(Date(run.timestampEpochMs)), color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f), fontSize = 10.sp)
+                          }
+                          IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, contentDescription = "Delete run", tint = Color(0xFFD84343)) }
+                      }
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                          Text(formatMsToSec(run.primaryTimeMs), fontSize = 26.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
+                          Text(
+                              if (mode?.kind == TestKind.BRAKING) formatDistance(run.totalDistanceM, useMph)
+                              else if (mode?.kind == TestKind.DISTANCE) "@ ${formatSpeed(run.trapSpeedKmh, useMph)}"
+                              else formatDistance(run.totalDistanceM, useMph),
+                              color = MaterialTheme.colorScheme.secondary, fontSize = 13.sp, fontWeight = FontWeight.Bold
+                          )
+                      }
+                      if (run.reactionTimeMs != null) Text("Reaction: ${formatSignedMs(run.reactionTimeMs)}", color = if (run.reactionTimeMs < 0) Color(0xFFD84343) else MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      Text("Peak G ${String.format(Locale.US, "%.2f", run.peakG)} · GPS ${String.format(Locale.US, "%.1f", run.gpsHz)} Hz · slope ${String.format(Locale.US, "%.2f", run.slopePercent)}%", color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.62f), fontSize = 10.sp)
+                  }
+              }
+          }
+          
+          @Composable
+          private fun MetricPill(label: String, value: String) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.widthIn(min = 64.dp)) {
+                  Text(label, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.58f), fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                  Text(value, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+              }
+          }
+          
+          @Composable
+          private fun SlipRow(label: String, value: String, highlight: Boolean = false) {
+              Row(
+                  modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(label, color = if (highlight) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f), fontSize = if (highlight) 11.sp else 10.sp, fontWeight = if (highlight) FontWeight.Bold else FontWeight.Normal, fontFamily = FontFamily.Monospace)
+                  Text(value, color = if (highlight) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface, fontSize = if (highlight) 12.sp else 10.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+              }
+          }
+          
+          private fun statusColor(status: RunStatus): Color = when (status) {
+              RunStatus.IDLE -> Color(0xFF78909C)
+              RunStatus.STAGED_STOP, RunStatus.STAGED_ROLL, RunStatus.STAGED_BRAKE -> Color(0xFFFFB300)
+              RunStatus.RUNNING -> Color(0xFF00C853)
+              RunStatus.COMPLETED -> Color(0xFF40C4FF)
+          }
+          
+          private fun speedForDisplay(speedKmh: Double, useMph: Boolean): Double = if (useMph) speedKmh / 1.609344 else speedKmh
+          private fun formatSpeed(speedKmh: Double, useMph: Boolean): String = String.format(Locale.US, "%.1f %s", speedForDisplay(speedKmh, useMph), if (useMph) "mph" else "km/h")
+          private fun formatDistance(distanceM: Double, useMph: Boolean): String = if (useMph) String.format(Locale.US, "%.1f ft", distanceM * 3.28084) else String.format(Locale.US, "%.1f m", distanceM)
+          private fun formatMsToSec(ms: Long): String = String.format(Locale.US, "%d.%03ds", ms / 1000, kotlin.math.abs(ms % 1000))
+          private fun formatNullableMs(ms: Long?): String = ms?.let { formatMsToSec(it) } ?: "—.———"
+          private fun formatSignedMs(ms: Long): String = (if (ms >= 0) "+" else "−") + String.format(Locale.US, "%d.%03ds", kotlin.math.abs(ms) / 1000, kotlin.math.abs(ms) % 1000)
+          private fun averageBrakingG(run: RunRecord): Double {
+              if (run.totalDistanceM <= 0.0) return 0.0
+              val speedMps = run.trapSpeedKmh / 3.6
+              return (speedMps * speedMps / (2.0 * run.totalDistanceM)) / 9.80665
+          }
+          
+          private fun playGreenBeep() {
+              try { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80).startTone(ToneGenerator.TONE_PROP_BEEP, 160) } catch (_: Exception) { }
+          }
+          
+          private fun shareRunsAsCsv(context: Context, runs: List<RunRecord>) {
+              val sb = StringBuilder()
+              sb.appendLine("ID,Timestamp,Mode,PrimaryTime_s,TrapSpeed_kmh,Distance_m,60ft_s,330ft_s,EighthMile_s,EighthSpeed_kmh,1000ft_s,0_100_s,100_150_s,150_200_s,Slope_pct,ValidSlope,PeakG,Rollout,GPS_Hz,Reaction_ms")
+              for (r in runs) {
+                  sb.appendLine(
+                      "${r.id},${r.timestampEpochMs},${r.testMode},${r.primaryTimeMs / 1000.0},${r.trapSpeedKmh},${r.totalDistanceM}," +
+                          "${r.time60ftMs?.div(1000.0) ?: ""},${r.time330ftMs?.div(1000.0) ?: ""},${r.timeEighthMileMs?.div(1000.0) ?: ""},${r.speedEighthMileKmh ?: ""}," +
+                          "${r.time1000ftMs?.div(1000.0) ?: ""},${r.time0to100Ms?.div(1000.0) ?: ""},${r.time100to150Ms?.div(1000.0) ?: ""},${r.time150to200Ms?.div(1000.0) ?: ""}," +
+                          "${r.slopePercent},${r.isValidSlope},${r.peakG},${r.rolloutEnabled},${r.gpsHz},${r.reactionTimeMs ?: ""}"
+                  )
+              }
+              val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                  type = "text/csv"
+                  putExtra(Intent.EXTRA_SUBJECT, "GPS Performance Runs Telemetry CSV")
+                  putExtra(Intent.EXTRA_TEXT, sb.toString())
+              }
+              context.startActivity(Intent.createChooser(sendIntent, "Export Telemetry CSV"))
+          }
+          EOF
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPS-Drag-Timer-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish Direct APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0.${{ github.run_number }}
+          name: "GPS Drag Timer Build #${{ github.run_number }}"
+          files: app/build/outputs/apk/debug/app-debug.apk
